@@ -1,0 +1,541 @@
+---
+title: "Monitoreo y Alerta - DMQ"
+autor: "Diego Jurado"
+runtime: shiny
+
+output:
+  flexdashboard::flex_dashboard:
+    orientation: rows
+    vertical_layout: scroll
+    Fuente: http://www.emseguridad-q.gob.ec/
+    theme: cerulean
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+library(flexdashboard)
+library(shiny)
+library(plotly)
+library(leaflet)
+library(tidyverse)
+library(sf)
+
+library(raster)
+
+library(xts)
+library(dygraphs)
+
+prec <- read.csv("D:/COE/Meteorologia/Base.csv")
+prec<- prec %>% 
+  dplyr::select(Fecha,Belisario,Carapungo,Centro, Cotocollao,Guamani,SanAntonio,LosChillos,Tumbaco,CalderonP20,BellavistaC05,#RumipambaC04,
+                YaruquiC06,SalvefachaC13,PuengasiC18,EltrojeC19,Paluguillo,Santa.Rosa,El.Cinto,Solanda,El.Tingo,San.Francisco,Colinas.Alto,El.CarmenP54,
+                Papallacta,INAMHI,Pichan,El.Bosque,Guayllabamba,Antenas,CruzLoma,Izobamba,Cumbaya) %>% 
+  mutate(Mes = month(Fecha), Anio = year(Fecha))
+  
+prec$Fecha <- as.Date(prec$Fecha, format = "%Y-%m-%d") # Convertir la columna Fecha
+
+#########################################################################################
+est<- st_read("D:/COE/Meteorologia/EstacioneEPMAPS/Estacionesfinal.shp")
+
+DMQ <- st_read("D:/COE/Productos Geografo/2024/Escenarios/Coberturas_escenario/AZ_ORD002_2024.shp")
+
+#####################################################################################################
+datos_filtrados <- reactive({
+    prec %>%
+      dplyr::select(Fecha, input$estacion) %>%
+      filter(Fecha >= input$fechas[1] & Fecha <= input$fechas[2]) %>%
+      rename(Lluvia = input$estacion)  # Renombrar la columna seleccionada a 'Lluvia'
+  })
+###########################################################################################################
+
+
+datos_mensuales <- reactive({
+  req(input$estacion, input$anio)  # Asegura que haya valores seleccionados
+
+  estacion_col <- sym(input$estacion)  # Convierte el nombre de la columna a un símbolo
+
+  # Datos del año seleccionado (esta bien)
+  datos_anio <- prec %>%
+    dplyr::select(Fecha, !!estacion_col, Anio, Mes) %>%
+    filter(Anio == input$anio) %>%
+    group_by(Anio, Mes) %>%
+    summarise(Lluvia = sum(!!estacion_col, na.rm = TRUE)) %>%
+    ungroup()
+
+###################################################################
+  
+  
+acumulado_mensual_historico <- prec %>%
+  group_by(Anio, Mes) %>%
+  summarise(Suma_Mensual = sum(!!estacion_col, na.rm = TRUE), .groups = "drop") %>%
+  filter(Suma_Mensual > 0)  # Excluir años con acumulado 0 o NA
+
+
+promedio_mensual_historico <- acumulado_mensual_historico %>%
+  group_by(Mes) %>%
+  summarise(Promedio = mean(Suma_Mensual, na.rm = TRUE), .groups = "drop")
+
+
+  # Unir los datos del año seleccionado con el promedio histórico
+  datos_mensuales <-  datos_anio%>%
+  left_join(promedio_mensual_historico, by = "Mes")
+})
+
+
+
+##############################################################################
+
+# 1. Calcular acumulado mensual por año de la estación Belisario
+
+
+anomalia <- reactive({
+  estacion_col <- sym(input$estacion)  # Convierte el nombre de la columna a un símbolo
+  
+acumulado_mensual_historico <- prec %>%
+  group_by(Anio, Mes) %>%
+  summarise(Suma_Mensual = sum(!!estacion_col, na.rm = TRUE), .groups = "drop") %>%
+  filter(Suma_Mensual > 0)  # Excluir años con acumulado 0 o NA
+
+promedio_mensual_historico <- acumulado_mensual_historico %>%
+  group_by(Mes) %>%
+  summarise(Promedio = mean(Suma_Mensual, na.rm = TRUE), .groups = "drop")
+
+# 3. Calcular acumulado de 2024
+acumulado <- prec %>%
+  filter(Anio == input$anio) %>%
+  group_by(Mes) %>%
+  summarise(Acumulado = sum(!!estacion_col, na.rm = TRUE), .groups = "drop")
+
+anomalia <- acumulado%>%
+  left_join(promedio_mensual_historico, by = "Mes") %>%
+  mutate(
+    Anomalia = Acumulado - Promedio,
+    Anomalia_Porcentaje = (Anomalia / Promedio) * 100
+
+)
+
+})
+################################################################################
+#Anomalias MAPA
+
+mapa_anomalia <-  reactive({
+# 4. Inicializar el dataframe final
+resultado <- data.frame(
+  NOMBRE = character(),
+  Lluvias_Acumuladas_Dic_2024 = numeric(),
+  Promedio_Historico_Diciembre = numeric(),
+  Anomalia = numeric(),
+  stringsAsFactors = FALSE
+)
+
+# 5. Crear un bucle para cada estación
+estaciones <- names(prec)[!names(prec) %in% c("Fecha", "Mes", "Anio")] # Excluir columnas no relacionadas a estaciones
+
+for (estacion in estaciones) {
+  # Filtrar datos de diciembre
+  data_diciembre <- prec %>%
+    filter(Mes == month(input$fechas[1])) %>%
+    dplyr::select(Anio, Mes, all_of(estacion))
+  
+  # Lluvias acumuladas de diciembre 2024
+  acumulado_2024 <- data_diciembre %>%
+    filter(Anio == year(input$fechas[1])) %>%
+    summarise(Acumulado = sum(.data[[estacion]], na.rm = TRUE)) %>%
+    pull(Acumulado)
+  
+  # Promedio histórico para diciembre, excluyendo años con 0 o NA
+  promedio_historico <- data_diciembre %>%
+    group_by(Anio) %>%
+    summarise(Suma_Mensual = sum(.data[[estacion]], na.rm = TRUE)) %>%
+    filter(Suma_Mensual > 0) %>% # Excluir los años con cero o NA
+    summarise(Promedio = mean(Suma_Mensual, na.rm = TRUE)) %>%
+    pull(Promedio)
+  
+  # Calcular anomalía
+  anomalia <- acumulado_2024 - promedio_historico
+  
+  # Agregar al dataframe final
+  resultado <- rbind(
+    resultado,
+    data.frame(
+      NOMBRE = estacion,
+      Lluvias_Acumuladas_Dic_2024 = acumulado_2024,
+      Promedio_Historico_Diciembre = promedio_historico,
+      Anomalia = anomalia
+    )
+  )
+}
+
+
+est<- st_read("D:/COE/Meteorologia/EstacioneEPMAPS/Estacionesfinal.shp")
+plot(est)
+DMQ <- st_read("D:/COE/Productos Geografo/2024/Escenarios/Coberturas_escenario/AZ_ORD002_2024.shp")
+
+estdf<- as.data.frame(est)
+
+Datos_p<- merge(x = resultado, y =estdf, by = "NOMBRE")
+
+
+ext <- extent(DMQ)
+grd <- expand.grid(x= seq(from = ext[1], to = ext[2], by=30), 
+                   y= seq(from = ext[3], to = ext[4], by=30))
+coordinates(grd) <- ~x + y
+gridded(grd)<- TRUE 
+crs(grd) <- crs(DMQ)
+
+coordinates(Datos_p)<- ~ESTE + NORTE
+crs(Datos_p) <- crs(DMQ)
+idw.p <- gstat::idw(Anomalia ~1, Datos_p, grd, idp=3.5,debug.level = 0)
+idw.p <- raster(idw.p)
+idw.p <- raster::mask(idw.p,DMQ)
+
+idw.p <- raster::projectRaster(idw.p, crs = "+proj=longlat +datum=WGS84")
+
+return(idw.p)
+
+})
+```
+
+Sidebar {.sidebar}
+================================================================================
+
+```{r}
+# Crear el selectInput para seleccionar la estación (ordenado alfabéticamente y excluyendo Anio y Mes)
+selectInput("estacion", "Seleccione la estación:",
+            choices = sort(names(prec)[!(names(prec) %in% c("Anio", "Mes", "Fecha"))]))  # Excluye Anio, Mes y Fecha
+
+
+# Crear el dateRangeInput para seleccionar el rango de fechas
+dateRangeInput("fechas", label = HTML("Datos Diarios<br>Selecciona Fecha:"),
+               start = "2025-01-01",  # Fecha inicial predeterminada
+               end = max(prec$Fecha),  # Fecha final: el máximo de la columna Fecha
+               min = min(prec$Fecha),  # Fecha mínima de la columna Fecha
+               max = max(prec$Fecha),  # Fecha máxima de la columna Fecha
+               format = "yyyy-mm-dd")  # Formato de fecha
+
+selectInput("anio", label = HTML("Datos Mensuales<br>Selecciona Año:"), 
+            choices = sort(unique(prec$Anio), decreasing = TRUE), 
+            selected = max(prec$Anio))
+
+
+
+
+```
+
+Precipitaciones
+================================================================================
+
+row
+-------------------------------------------------------------------------------
+
+### Dias Secos
+
+```{r}
+renderValueBox({ 
+  # Obtener los datos filtrados
+  datos <- datos_filtrados()
+  
+  # Si no hay datos, devolver 0 días secos consecutivos
+  if (nrow(datos) == 0) {
+    return(valueBox(0, "Días Secos Consecutivos", icon = "sun", color = "gray"))
+  }
+  
+  # Ordenar los datos por fecha ascendente
+  datos <- datos %>%
+    arrange(Fecha)
+  
+  # Calcular los días secos consecutivos
+  dias_secos_consecutivos <- rep(0, nrow(datos))  # Inicializar vector de días secos
+  contador <- 0  # Contador de días secos
+  
+  for (i in 1:nrow(datos)) {
+    # Verificar que no haya NA en la fecha ni en la lluvia
+    if (!is.na(datos$Fecha[i]) && !is.na(datos$Lluvia[i]) && datos$Lluvia[i] <= 1) {
+      
+      # Si es el primer dato o la diferencia de fechas no es 1 día, reiniciar el contador
+      if (i == 1 || as.numeric(difftime(datos$Fecha[i], datos$Fecha[i - 1], units = "days")) != 1) {
+        contador <- 1  # Comienza un nuevo conteo si no es consecutivo
+      } else {
+        contador <- contador + 1  # Aumentar si no hay lluvia (≤1 mm) y es consecutivo
+      }
+      
+    } else {
+      contador <- 0  # Reiniciar si hay lluvia o si la fecha es NA
+    }
+    
+    dias_secos_consecutivos[i] <- contador  # Guardar valor
+  }
+  
+  # Agregar columna al dataframe
+  datos$dias_secos_consecutivos <- dias_secos_consecutivos
+  
+  # Obtener el último valor de días secos consecutivos
+  ultimos_dias_secos <- tail(datos$dias_secos_consecutivos, 1)
+  
+  # Determinar el color del ValueBox según los días secos consecutivos
+  color <- case_when(
+    ultimos_dias_secos <= 5 ~ "#28a745",  # Verde para 0-5 días secos consecutivos
+    ultimos_dias_secos <= 10 ~ "#ffc107",  # Amarillo para 6-10 días secos consecutivos
+    ultimos_dias_secos > 10 ~ "#dc3545"    # Rojo para más de 10 días secos consecutivos
+  )
+  
+  # Crear el ValueBox con el último valor de días secos consecutivos
+  valueBox(ultimos_dias_secos, "Días Secos Consecutivos", icon = "sun", color = color)
+})
+
+
+```
+
+### Dias Consecutivos
+
+```{r}
+renderValueBox({
+  # Obtener los datos filtrados
+  datos <- datos_filtrados()
+
+  # Si no hay datos, devolver 0 días consecutivos
+  if (nrow(datos) == 0) {
+    return(valueBox(0, "Días Consecutivos de Lluvia", icon = "cloud-rain", color = "gray"))
+  }
+
+  # Ordenar los datos por fecha ascendente
+  datos <- datos %>%
+    arrange(Fecha)
+
+  # Calcular los días consecutivos de lluvia
+  dias_consecutivos <- rep(0, nrow(datos))  # Inicializar vector de días consecutivos
+  contador <- 0  # Contador de días
+  
+  for (i in 1:nrow(datos)) {
+    # Verificar que no haya NA en la fecha ni en la lluvia
+    if (!is.na(datos$Fecha[i]) && !is.na(datos$Lluvia[i]) && datos$Lluvia[i] > 1) {
+      
+      # Si es el primer dato o la diferencia de fechas no es 1 día, reiniciar el contador
+      if (i == 1 || as.numeric(difftime(datos$Fecha[i], datos$Fecha[i - 1], units = "days")) != 1) {
+        contador <- 1  # Comienza un nuevo conteo si no es consecutivo
+      } else {
+        contador <- contador + 1  # Aumentar si hay lluvia (>1) y es consecutivo
+      }
+      
+    } else {
+      contador <- 0  # Reiniciar si no hay lluvia o si la fecha es NA
+    }
+    
+    dias_consecutivos[i] <- contador  # Guardar valor
+  }
+
+  # Agregar columna al dataframe
+  datos$dias_consecutivos <- dias_consecutivos
+
+  # Obtener el último valor de días consecutivos
+  ultimos_dias_consecutivos <- tail(datos$dias_consecutivos, 1)
+
+  # Determinar el color del ValueBox según los días consecutivos
+  color <- case_when(
+    ultimos_dias_consecutivos == 0 ~ "#28a745",  # Verde para 0 días consecutivos
+    ultimos_dias_consecutivos > 0 & ultimos_dias_consecutivos <= 5 ~ "#ffc107",  # Amarillo para 1-5 días consecutivos
+    ultimos_dias_consecutivos > 5 ~ "#dc3545"    # Rojo para más de 5 días consecutivos
+  )
+
+  # Crear el ValueBox con el último valor de días consecutivos
+  valueBox(ultimos_dias_consecutivos, "Días Consecutivos de Lluvia", icon = "cloud-rain", color = color)
+})
+
+```
+
+### Máximo Registrado 
+
+```{r}
+
+renderValueBox({
+  # Obtener el nombre de la estación seleccionada desde el input
+  estacion_col <- input$estacion
+  
+  # Calcular el máximo registrado de precipitación para la estación seleccionada en toda la serie
+  max_precipitacion_total <- max(prec[[estacion_col]], na.rm = TRUE)
+  
+  # Si no hay datos, establecer el valor máximo como 0
+  max_precipitacion_total <- ifelse(is.finite(max_precipitacion_total), max_precipitacion_total, 0)
+
+  # Mostrar el valueBox con el valor máximo registrado de toda la serie para la estación seleccionada
+  valueBox(max_precipitacion_total, "Máximo Registrado (2000-2025)", icon = "fa-tachometer-alt", color = "aqua")
+})
+
+
+```
+
+### Total mes
+
+```{r}
+renderValueBox({
+  # Obtener el nombre de la estación seleccionada desde el input
+  estacion_col <- input$estacion
+  
+  # Obtener las fechas seleccionadas desde el dateRangeInput
+  fechas_seleccionadas <- input$fechas
+  
+  # Extraer el rango de fechas (inicio y fin)
+  fecha_inicio <- fechas_seleccionadas[1]
+  fecha_fin <- fechas_seleccionadas[2]
+  
+  # Filtrar los datos según el rango de fechas seleccionado
+  datos_filtrados <- prec[prec$Fecha >= fecha_inicio & prec$Fecha <= fecha_fin, ]
+  
+  # Calcular la suma total de precipitación para la estación seleccionada dentro del rango de fechas
+  suma_precipitacion_total <- sum(datos_filtrados[[estacion_col]], na.rm = TRUE)
+  
+  # Si no hay datos, establecer la suma como 0
+  suma_precipitacion_total <- ifelse(is.finite(suma_precipitacion_total), suma_precipitacion_total, 0)
+  
+  # Mostrar el valueBox con la suma total de precipitación para la estación seleccionada y el rango de fechas
+  valueBox(
+    suma_precipitacion_total, 
+    paste("Suma Total de Precipitación (", format(fecha_inicio, "%Y-%m-%d"), " a ", format(fecha_fin, "%Y-%m-%d"), ")", sep = ""),
+    icon = "fa-tachometer-alt", 
+    color = "#104E8B"
+  )
+})
+
+
+
+
+```
+
+row {.tabset .tabset-fade}
+-------------------------------------------------------------------------------
+
+### Diario
+
+```{r}
+ # Gráfico Diario con dygraph
+output$graficoLluvias <- renderDygraph({
+  datos <- datos_filtrados()
+  
+  # Crear una serie temporal
+  serie_temporal <- xts(datos$Lluvia, order.by = datos$Fecha)
+  
+ # Crear el gráfico con dygraph
+  dygraph(serie_temporal, main = paste("Lluvias Diarias en", input$estacion)) %>%
+    dyAxis("x", label = "Fecha") %>%
+    dyAxis("y", label = "Precipitación (mm)") %>%
+    dyOptions(labelsUTC = FALSE) %>%
+    dyRangeSelector() %>%  # Barra deslizante
+    dySeries("V1", color = "blue", strokeWidth = 3)  # Cambiar color y ancho de la línea
+})
+
+dygraphOutput("graficoLluvias")
+```
+
+### Mensual
+
+```{r}
+#Función para filtrar y agrupar los datos por mes
+
+output$graficoMensual <- renderPlotly({
+  datos <- datos_mensuales()  # Obtiene los datos reactivos
+  
+  # Verifica si hay datos disponibles
+  if (nrow(datos) == 0) return(NULL)  
+
+  # Crear un vector con los nombres de los meses en español
+  meses <- c("Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio", 
+             "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre")
+  
+  # Gráfico base con ggplot
+  p <- ggplot(datos, aes(x = Mes)) +
+    geom_bar(aes(y = Lluvia), stat = "identity", fill = "blue", alpha = 0.8, width = 0.5) +  # Barras del año seleccionado
+    geom_line(aes(y = Promedio), color = "red", size = 0.6, linetype = "dashed") +  # Línea del promedio histórico
+    geom_point(aes(y = Promedio), color = "red", size = 1.5) +  # Puntos en la línea para mayor claridad
+    scale_x_continuous(breaks = 1:12, labels = meses) +  # Mostrar meses en español
+    labs(title = "Comparación de Lluvia Mensual vs. Promedio Histórico",
+         x = "Mes",
+         y = "Precipitación (mm)") +
+    theme_minimal()
+
+  # Convertir a plotly sin modificar el estilo base
+  ggplotly(p)
+})
+
+# Salida del gráfico
+plotlyOutput("graficoMensual")
+
+
+
+
+
+```
+
+### Anual
+
+row 
+-------------------------------------------------------------------------------
+
+### Anomalía
+
+```{r}
+
+# Definir los nombres de los meses en español
+meses_es <- c("Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio", 
+              "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre")
+
+output$graficoAnomalia <- renderPlotly({
+  anomalias <- anomalia()
+  
+  if (nrow(anomalias) == 0) return(NULL)  # Evita errores si no hay datos
+  
+  # Asignar los nombres de los meses en español
+  anomalias$MesNombre <- factor(meses_es[anomalias$Mes], levels = meses_es)
+
+  p <- ggplot(anomalias, aes(x = MesNombre, y = Anomalia_Porcentaje, fill = Anomalia_Porcentaje, 
+                             text = paste0("Mes: ", MesNombre, 
+                                           "<br>Anomalía: ", round(Anomalia, 2), " mm",
+                                           "<br>Anomalía %: ", round(Anomalia_Porcentaje, 2), "%"))) +
+    geom_bar(stat = "identity") +
+    scale_fill_gradient2(low = "red4", mid = "lightgray", high = "blue4", midpoint = 0) +
+    labs(title = "Anomalía de Precipitación (%)",
+         x = "Mes",
+         y = "Anomalía (%)") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))  # Inclinación de etiquetas
+
+  ggplotly(p, tooltip = "text")  # Mostrar información en el tooltip
+})
+
+plotlyOutput("graficoAnomalia")
+
+```
+
+
+### Mapa Anomalia
+
+```{r}
+
+output$mapaAnomalia <- renderLeaflet({
+  # Asegúrate de que mapa_anomalia esté disponible
+  req(mapa_anomalia())  
+  
+  # Extraemos idw.p desde el retorno de mapa_anomalia
+  idw.p <- mapa_anomalia()  
+  
+  # Define los límites del mapa para asegurar que se vea correctamente
+  bounds <- extent(idw.p)
+  
+  paleta_color <- colorNumeric(
+  palette = colorRampPalette(c("red", "lightgray", "blue"))(5),
+  domain = values(idw.p), 
+  na.color = "transparent"
+)
+
+leaflet() %>%
+  addTiles() %>%
+  addRasterImage(idw.p, colors = paleta_color, opacity = 0.7) %>%
+  fitBounds(bounds@xmin, bounds@ymin, bounds@xmax, bounds@ymax)
+
+})
+
+leafletOutput("mapaAnomalia")
+
+```
+
+
+
